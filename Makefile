@@ -1,4 +1,4 @@
-# Build local-rss for several platforms. Binaries end up in dist/.
+# Build local-gitlab-rss for several platforms. Binaries end up in dist/.
 #
 #   make                 everything: macOS (native) + Linux amd64/arm64
 #   make mac             macOS, current architecture
@@ -9,7 +9,7 @@
 # Linux builds run in a rust:alpine container, so the binaries are statically
 # linked against musl and run on any distro (no glibc version issues).
 
-BIN   := local-rss
+BIN   := local-gitlab-rss
 DIST  := dist
 IMAGE := rust:alpine
 
@@ -17,7 +17,7 @@ IMAGE := rust:alpine
 define docker_build
 	docker run --rm --platform linux/$(1) \
 		-v "$(CURDIR)":/src -w /src \
-		-v local-rss-cargo-registry:/usr/local/cargo/registry \
+		-v local-gitlab-rss-cargo-registry:/usr/local/cargo/registry \
 		-e CARGO_TARGET_DIR=/src/target/docker-$(1) \
 		$(IMAGE) sh -c 'apk add --no-cache musl-dev >/dev/null && cargo build --release --locked'
 	cp target/docker-$(1)/release/$(BIN) $(DIST)/$(BIN)-linux-$(1)

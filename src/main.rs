@@ -18,35 +18,41 @@ use ureq::tls::{RootCerts, TlsConfig};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const USAGE: &str = "\
-Tiny Atom/RSS feed reader that sends new items to Telegram.
+Atom/RSS feed reader (made for GitLab activity feeds) that sends new items to Telegram.
 
 Usage:
-  local-rss telegram [chat_id]
-                          connect Telegram; without chat_id, uses the last chat
-                          that messaged the bot (send it any message first)
-  local-rss test          send a test message to Telegram
-  local-rss add <url>     subscribe to a feed (existing items are marked as seen)
-  local-rss remove <feed> unsubscribe
-  local-rss list          show subscribed feeds (numbered) and their filters
-  local-rss filter <feed> include <regex>
-                          only send items whose title matches (any include)
-  local-rss filter <feed> exclude <regex>
-                          never send items whose title matches
-  local-rss filter <feed> clear
-                          remove all filters
-  local-rss preview <feed>
-                          show current feed items and which would be sent
-  local-rss check         check all feeds once, send new items to Telegram
-  local-rss run [minutes] check in a loop (default every 10 minutes)
+  local-gitlab-rss telegram [chat_id]
+      connect Telegram; without chat_id, uses the last chat
+      that messaged the bot (send it any message first)
+  local-gitlab-rss test
+      send a test message to Telegram
+  local-gitlab-rss add <url>
+      subscribe to a feed (existing items are marked as seen)
+  local-gitlab-rss remove <feed>
+      unsubscribe
+  local-gitlab-rss list
+      show subscribed feeds (numbered) and their filters
+  local-gitlab-rss filter <feed> include <regex>
+      only send items whose title matches (any include)
+  local-gitlab-rss filter <feed> exclude <regex>
+      never send items whose title matches
+  local-gitlab-rss filter <feed> clear
+      remove all filters
+  local-gitlab-rss preview <feed>
+      show current feed items and which would be sent
+  local-gitlab-rss check
+      check all feeds once, send new items to Telegram
+  local-gitlab-rss run [minutes]
+      check in a loop (default every 10 minutes)
 
 <feed> is a number from `list` or the feed URL. Filters match the item title,
 e.g. for GitLab: 'pushed new project tag', 'pushed to project branch (main|master) '.
 
 Config (environment variables, or a .env file in the data directory):
   TELEGRAM_TOKEN          bot token from @BotFather (required)
-  TELEGRAM_CHAT_ID        chat to send to (optional; `local-rss telegram` saves it)
+  TELEGRAM_CHAT_ID        chat to send to (optional; `local-gitlab-rss telegram` saves it)
   TELEGRAM_THREAD_ID      forum topic to post in (optional; for groups with topics)
-  LOCAL_RSS_DIR           where data.json and .env live (default: the project dir)";
+  LOCAL_GITLAB_RSS_DIR    where data.json and .env live (default: the project dir)";
 
 const ATOM_NS: &str = "http://www.w3.org/2005/Atom";
 const MAX_SEEN_PER_FEED: usize = 500;
@@ -56,7 +62,7 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
-        .user_agent("local-rss/1.0")
+        .user_agent("local-gitlab-rss/1.0")
         .tls_config(
             TlsConfig::builder()
                 .root_certs(RootCerts::PlatformVerifier)
@@ -121,7 +127,7 @@ fn resolve_feed(data: &Data, key: &str) -> Result<String> {
         .and_then(|n| n.checked_sub(1))
         .and_then(|i| data.feeds.keys().nth(i))
         .cloned()
-        .ok_or_else(|| format!("no such feed: {key} (see `local-rss list`)").into())
+        .ok_or_else(|| format!("no such feed: {key} (see `local-gitlab-rss list`)").into())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,7 +142,7 @@ struct Item {
 }
 
 fn data_dir() -> PathBuf {
-    env::var_os("LOCAL_RSS_DIR")
+    env::var_os("LOCAL_GITLAB_RSS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
 }
@@ -323,7 +329,7 @@ impl TgConfig {
         let chat_id = self
             .chat_id
             .as_deref()
-            .ok_or("no chat id: run `local-rss telegram` or set TELEGRAM_CHAT_ID")?;
+            .ok_or("no chat id: run `local-gitlab-rss telegram` or set TELEGRAM_CHAT_ID")?;
         let mut text = format!("<b>{}</b>\n", html_escape(feed_title));
         if link.is_empty() {
             text += &html_escape(title);
@@ -434,7 +440,7 @@ fn run(args: &[&str]) -> Result<()> {
                 chat_id: Some(chat_id.clone()),
                 ..tg
             };
-            tg.send("local-rss", "Telegram connected ✅", "")
+            tg.send("local-gitlab-rss", "Telegram connected ✅", "")
                 .map_err(|e| format!("Telegram setup failed: {e}"))?;
             let value = chat_id
                 .parse::<i64>()
@@ -446,7 +452,7 @@ fn run(args: &[&str]) -> Result<()> {
         }
         ["test"] => {
             TgConfig::from(&data)
-                .send("local-rss", "Test message", "https://example.com")
+                .send("local-gitlab-rss", "Test message", "https://example.com")
                 .map_err(|e| format!("Failed: {e}"))?;
             println!("Sent.");
         }
