@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use std::{env, process, thread};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ureq::tls::{RootCerts, TlsConfig};
@@ -25,10 +26,21 @@ Usage:
                           that messaged the bot (send it any message first)
   local-rss test          send a test message to Telegram
   local-rss add <url>     subscribe to a feed (existing items are marked as seen)
-  local-rss remove <url>  unsubscribe
-  local-rss list          show subscribed feeds
+  local-rss remove <feed> unsubscribe
+  local-rss list          show subscribed feeds (numbered) and their filters
+  local-rss filter <feed> include <regex>
+                          only send items whose title matches (any include)
+  local-rss filter <feed> exclude <regex>
+                          never send items whose title matches
+  local-rss filter <feed> clear
+                          remove all filters
+  local-rss preview <feed>
+                          show current feed items and which would be sent
   local-rss check         check all feeds once, send new items to Telegram
   local-rss run [minutes] check in a loop (default every 10 minutes)
+
+<feed> is a number from `list` or the feed URL. Filters match the item title,
+e.g. for GitLab: 'pushed new project tag', 'pushed to project branch (main|master) '.
 
 Config (environment variables, or a .env file in the data directory):
   TELEGRAM_TOKEN          bot token from @BotFather (required)
@@ -64,6 +76,42 @@ struct Feed {
     title: String,
     #[serde(default)]
     seen: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exclude: Vec<String>,
+}
+
+struct Filter {
+    include: Vec<Regex>,
+    exclude: Vec<Regex>,
+}
+
+impl Filter {
+    fn new(feed: &Feed) -> Result<Self> {
+        let compile = |patterns: &[String]| -> Result<Vec<Regex>> {
+            patterns.iter().map(|p| Regex::new(p).map_err(|e| format!("bad filter {p:?}: {e}").into())).collect()
+        };
+        Ok(Filter { include: compile(&feed.include)?, exclude: compile(&feed.exclude)? })
+    }
+
+    fn matches(&self, title: &str) -> bool {
+        (self.include.is_empty() || self.include.iter().any(|r| r.is_match(title)))
+            && !self.exclude.iter().any(|r| r.is_match(title))
+    }
+}
+
+/// Accept either a 1-based number from `list` or the feed URL.
+fn resolve_feed(data: &Data, key: &str) -> Result<String> {
+    if data.feeds.contains_key(key) {
+        return Ok(key.to_string());
+    }
+    key.parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|i| data.feeds.keys().nth(i))
+        .cloned()
+        .ok_or_else(|| format!("no such feed: {key} (see `local-rss list`)").into())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -139,8 +187,17 @@ fn child_text(node: roxmltree::Node, ns: Option<&str>, name: &str) -> String {
         .to_string()
 }
 
+/// Some feeds (GitLab) escape titles twice, leaving `&quot;` etc. in the text.
+fn unescape_entities(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 fn or_untitled(title: String) -> String {
-    if title.is_empty() { "(untitled)".into() } else { title }
+    if title.is_empty() { "(untitled)".into() } else { unescape_entities(&title) }
 }
 
 /// Returns (feed_title, items) for Atom or RSS 2.0.
@@ -254,6 +311,13 @@ impl TgConfig {
 fn check(data: &mut Data) -> Result<()> {
     let tg = TgConfig::from(data);
     for (url, feed) in data.feeds.iter_mut() {
+        let filter = match Filter::new(feed) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[error] {url}: {e}");
+                continue;
+            }
+        };
         let (title, items) = match fetch(url).and_then(|xml| parse(&xml)) {
             Ok(r) => r,
             Err(e) => {
@@ -271,6 +335,11 @@ fn check(data: &mut Data) -> Result<()> {
         let new: Vec<&Item> = items.iter().filter(|it| !feed.seen.contains(&it.id)).collect();
         for it in new.into_iter().rev() {
             // oldest first
+            if !filter.matches(&it.title) {
+                // Filtered out: mark as seen so it isn't reconsidered.
+                feed.seen.push(it.id.clone());
+                continue;
+            }
             println!("[new] {}: {}  {}", feed.title, it.title, it.link);
             if let Err(e) = tg.send(&feed.title, &it.title, &it.link) {
                 // Leave it unseen so it's retried on the next check.
@@ -335,20 +404,58 @@ fn run(args: &[&str]) -> Result<()> {
             println!("Added '{title}' ({} existing items marked as seen)", items.len());
             data.feeds.insert(
                 url.to_string(),
-                Feed { title: shown, seen: items.into_iter().map(|it| it.id).collect() },
+                Feed { title: shown, seen: items.into_iter().map(|it| it.id).collect(), ..Default::default() },
             );
             save(&data)?;
         }
-        ["remove", url] => {
-            if data.feeds.remove(*url).is_none() {
-                println!("Not subscribed to that feed");
-            }
+        ["remove", key] => {
+            let url = resolve_feed(&data, key)?;
+            data.feeds.remove(&url);
             save(&data)?;
+            println!("Removed {url}");
         }
         ["list"] => {
-            for (url, feed) in &data.feeds {
-                println!("{}\n  {url}", feed.title);
+            for (i, (url, feed)) in data.feeds.iter().enumerate() {
+                println!("{}. {}\n   {url}", i + 1, feed.title);
+                for p in &feed.include {
+                    println!("   include: {p}");
+                }
+                for p in &feed.exclude {
+                    println!("   exclude: {p}");
+                }
             }
+        }
+        ["filter", key, kind @ ("include" | "exclude"), pattern] => {
+            Regex::new(pattern).map_err(|e| format!("bad regex: {e}"))?;
+            let url = resolve_feed(&data, key)?;
+            let feed = data.feeds.get_mut(&url).unwrap();
+            let list = if *kind == "include" { &mut feed.include } else { &mut feed.exclude };
+            list.push(pattern.to_string());
+            let title = feed.title.clone();
+            save(&data)?;
+            println!("Added {kind} filter {pattern:?} to '{title}'");
+        }
+        ["filter", key, "clear"] => {
+            let url = resolve_feed(&data, key)?;
+            let feed = data.feeds.get_mut(&url).unwrap();
+            feed.include.clear();
+            feed.exclude.clear();
+            let title = feed.title.clone();
+            save(&data)?;
+            println!("Cleared filters for '{title}'");
+        }
+        ["preview", key] => {
+            let url = resolve_feed(&data, key)?;
+            let feed = &data.feeds[&url];
+            let filter = Filter::new(feed)?;
+            let (_, items) = fetch(&url).and_then(|xml| parse(&xml))?;
+            let mut sent = 0;
+            for it in &items {
+                let ok = filter.matches(&it.title);
+                sent += ok as usize;
+                println!("{} {}", if ok { "✅" } else { "  ·" }, it.title);
+            }
+            println!("\n{sent} of {} items would be sent", items.len());
         }
         ["check"] => check(&mut data)?,
         [] | ["run"] | ["run", _] => {
