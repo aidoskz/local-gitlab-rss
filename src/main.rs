@@ -90,7 +90,10 @@ struct Filter {
 impl Filter {
     fn new(feed: &Feed) -> Result<Self> {
         let compile = |patterns: &[String]| -> Result<Vec<Regex>> {
-            patterns.iter().map(|p| Regex::new(p).map_err(|e| format!("bad filter {p:?}: {e}").into())).collect()
+            patterns
+                .iter()
+                .map(|p| Regex::new(p).map_err(|e| format!("bad filter {p:?}: {e}").into()))
+                .collect()
         };
         Ok(Filter { include: compile(&feed.include)?, exclude: compile(&feed.exclude)? })
     }
