@@ -6,10 +6,11 @@ mod gitlab;
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, process, thread};
@@ -68,7 +69,8 @@ Config (environment variables, or a .env file in the data directory):
   TELEGRAM_TOKEN          bot token from @BotFather (required)
   TELEGRAM_CHAT_ID        chat to send to (optional; `local-gitlab-rss telegram` saves it)
   TELEGRAM_THREAD_ID      forum topic to post in (optional; for groups with topics)
-  LOCAL_GITLAB_RSS_DIR    where data.json and .env live (default: the project dir)
+  LOCAL_GITLAB_RSS_DIR    where data.json and .env live (default: next to the binary
+                          if they are there, otherwise the project dir it was built in)
   GITLAB_URL              digest: GitLab base URL, e.g. https://gitlab.example.com
   GITLAB_TOKEN            digest: access token with read_api scope
   GITLAB_GROUP            digest: group path or id whose projects are counted
@@ -169,9 +171,50 @@ struct Item {
 }
 
 fn data_dir() -> PathBuf {
-    env::var_os("LOCAL_GITLAB_RSS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    pick_data_dir(
+        env::var_os("LOCAL_GITLAB_RSS_DIR"),
+        env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        |p| p.exists(),
+    )
+}
+
+/// LOCAL_GITLAB_RSS_DIR if set; otherwise the binary's own directory when
+/// data.json or .env sit next to it (a binary copied to a server); otherwise
+/// the project directory it was built in, if that exists here (`cargo run`);
+/// otherwise the binary's directory.
+fn pick_data_dir(
+    var: Option<OsString>,
+    exe_dir: Option<PathBuf>,
+    build_dir: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(v) = var.filter(|v| !v.is_empty()) {
+        return PathBuf::from(v);
+    }
+    if let Some(dir) = &exe_dir {
+        if exists(&dir.join("data.json")) || exists(&dir.join(".env")) {
+            return dir.clone();
+        }
+    }
+    if exists(build_dir) {
+        return build_dir.to_path_buf();
+    }
+    exe_dir.unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Say where the bot reads its settings from, and what is missing there.
+fn print_data_dir(data: &Data) {
+    let dir = data_dir();
+    println!("Data directory: {}", dir.display());
+    if !dir.is_dir() {
+        eprintln!("[warn] it does not exist; set LOCAL_GITLAB_RSS_DIR to the folder with .env and data.json");
+    } else if env::var_os("TELEGRAM_TOKEN").is_none() && !dir.join(".env").exists() {
+        eprintln!("[warn] no .env there and TELEGRAM_TOKEN is not set");
+    }
+    if data.feeds.is_empty() && data.digest.is_none() {
+        eprintln!("[warn] no data.json there yet: add a feed with `add <url>`, or point LOCAL_GITLAB_RSS_DIR at the folder with data.json");
+    }
 }
 
 fn load() -> Result<Data> {
@@ -183,7 +226,15 @@ fn load() -> Result<Data> {
 }
 
 fn save(data: &Data) -> Result<()> {
-    let path = data_dir().join("data.json");
+    let dir = data_dir();
+    if !dir.is_dir() {
+        return Err(format!(
+            "data directory {} does not exist; set LOCAL_GITLAB_RSS_DIR to the folder with .env and data.json",
+            dir.display()
+        )
+        .into());
+    }
+    let path = dir.join("data.json");
     let tmp = path.with_extension("tmp");
     // Feed URLs can contain tokens, so keep the file private.
     let mut f = fs::OpenOptions::new()
@@ -544,6 +595,9 @@ fn run(args: &[&str]) -> Result<()> {
             println!("Removed {url}");
         }
         ["list"] => {
+            if data.feeds.is_empty() {
+                println!("No feeds in {}", data_dir().join("data.json").display());
+            }
             for (i, (url, feed)) in data.feeds.iter().enumerate() {
                 println!("{}. {}\n   {url}", i + 1, feed.title);
                 for p in &feed.include {
@@ -611,6 +665,7 @@ fn run(args: &[&str]) -> Result<()> {
             }
         }
         ["digest", "run"] => {
+            print_data_dir(&data);
             println!("Sending a digest at the top of every hour. Ctrl+C to stop.");
             loop {
                 let now = unix_now();
@@ -643,6 +698,7 @@ fn run(args: &[&str]) -> Result<()> {
                 Some(m) => m.parse().map_err(|_| format!("invalid minutes: {m}"))?,
                 None => 10.0,
             };
+            print_data_dir(&data);
             println!(
                 "Checking {} feeds every {minutes} min. Ctrl+C to stop.",
                 data.feeds.len()
@@ -670,5 +726,39 @@ fn main() {
     if let Err(e) = run(&args) {
         eprintln!("{e}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pick(var: Option<&str>, exe: Option<&str>, existing: &[&str]) -> PathBuf {
+        let existing: Vec<PathBuf> = existing.iter().map(PathBuf::from).collect();
+        pick_data_dir(var.map(OsString::from), exe.map(PathBuf::from), Path::new("/build/bot"), |p| {
+            existing.iter().any(|e| e == p)
+        })
+    }
+
+    #[test]
+    fn data_dir_env_var_wins() {
+        assert_eq!(pick(Some("/srv/bot"), Some("/root/repo"), &["/root/repo/.env"]), PathBuf::from("/srv/bot"));
+    }
+
+    #[test]
+    fn data_dir_prefers_files_next_to_the_binary() {
+        assert_eq!(pick(None, Some("/root/repo"), &["/root/repo/data.json", "/build/bot"]), PathBuf::from("/root/repo"));
+        assert_eq!(pick(Some(""), Some("/root/repo"), &["/root/repo/.env"]), PathBuf::from("/root/repo"));
+    }
+
+    #[test]
+    fn data_dir_uses_build_dir_for_cargo_run() {
+        assert_eq!(pick(None, Some("/build/bot/target/debug"), &["/build/bot"]), PathBuf::from("/build/bot"));
+    }
+
+    #[test]
+    fn data_dir_falls_back_to_binary_dir_when_build_dir_is_gone() {
+        assert_eq!(pick(None, Some("/root/repo"), &[]), PathBuf::from("/root/repo"));
+        assert_eq!(pick(None, None, &[]), PathBuf::from("."));
     }
 }
