@@ -1,4 +1,8 @@
-//! Tiny Atom/RSS feed reader that sends new items to Telegram.
+//! Tiny Atom/RSS feed reader that sends new items to Telegram,
+//! plus an hourly/daily commit digest built from the GitLab API.
+
+mod digest;
+mod gitlab;
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -7,7 +11,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, process, thread};
 
 use regex::Regex;
@@ -45,6 +49,18 @@ Usage:
   local-gitlab-rss run [minutes]
       check in a loop (default every 10 minutes)
 
+Digest (GitLab API instead of the feed; needs GITLAB_URL, GITLAB_TOKEN, GITLAB_GROUP):
+  local-gitlab-rss digest preview [hours]
+      print the report for the last hours (default 1), nothing is sent
+  local-gitlab-rss digest check
+      send the report for the time since the last check (and a finished day)
+  local-gitlab-rss digest run
+      send a report at the top of every hour; at local midnight also the day report
+  local-gitlab-rss digest today
+      print today's commit counts so far
+  local-gitlab-rss alias [<author name or e-mail> <name to show>]
+      merge an author's other names/e-mails into one person; without arguments, list
+
 <feed> is a number from `list` or the feed URL. Filters match the item title,
 e.g. for GitLab: 'pushed new project tag', 'pushed to project branch (main|master) '.
 
@@ -52,7 +68,16 @@ Config (environment variables, or a .env file in the data directory):
   TELEGRAM_TOKEN          bot token from @BotFather (required)
   TELEGRAM_CHAT_ID        chat to send to (optional; `local-gitlab-rss telegram` saves it)
   TELEGRAM_THREAD_ID      forum topic to post in (optional; for groups with topics)
-  LOCAL_GITLAB_RSS_DIR    where data.json and .env live (default: the project dir)";
+  LOCAL_GITLAB_RSS_DIR    where data.json and .env live (default: the project dir)
+  GITLAB_URL              digest: GitLab base URL, e.g. https://gitlab.example.com
+  GITLAB_TOKEN            digest: access token with read_api scope
+  GITLAB_GROUP            digest: group path or id whose projects are counted
+  GITLAB_PROJECTS         digest: only these project paths, comma-separated
+                          (default: every project of the group)
+  DIGEST_UTC_OFFSET       digest: local time zone, whole hours (default 5)
+  DIGEST_TITLES           digest: commit titles shown per person (default 3)
+  DIGEST_TITLE_LEN        digest: characters per title (default 60)
+  DIGEST_EXCLUDE          digest: regex on author name/e-mail to skip (e.g. bots)";
 
 const ATOM_NS: &str = "http://www.w3.org/2005/Atom";
 const MAX_SEEN_PER_FEED: usize = 500;
@@ -78,6 +103,8 @@ struct Data {
     feeds: BTreeMap<String, Feed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     telegram: Option<Telegram>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    digest: Option<digest::State>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -322,14 +349,6 @@ impl TgConfig {
     }
 
     fn send(&self, feed_title: &str, title: &str, link: &str) -> Result<()> {
-        let token = self
-            .token
-            .as_deref()
-            .ok_or("TELEGRAM_TOKEN is not set (in the environment or .env)")?;
-        let chat_id = self
-            .chat_id
-            .as_deref()
-            .ok_or("no chat id: run `local-gitlab-rss telegram` or set TELEGRAM_CHAT_ID")?;
         let mut text = format!("<b>{}</b>\n", html_escape(feed_title));
         if link.is_empty() {
             text += &html_escape(title);
@@ -340,10 +359,24 @@ impl TgConfig {
                 html_escape(title)
             );
         }
+        self.send_html(&text)
+    }
+
+    /// Send text that is already Telegram HTML.
+    fn send_html(&self, text: &str) -> Result<()> {
+        let token = self
+            .token
+            .as_deref()
+            .ok_or("TELEGRAM_TOKEN is not set (in the environment or .env)")?;
+        let chat_id = self
+            .chat_id
+            .as_deref()
+            .ok_or("no chat id: run `local-gitlab-rss telegram` or set TELEGRAM_CHAT_ID")?;
         let mut params = vec![
             ("chat_id", chat_id),
-            ("text", &text),
+            ("text", text),
             ("parse_mode", "HTML"),
+            ("disable_web_page_preview", "true"),
         ];
         if let Some(thread_id) = &self.thread_id {
             params.push(("message_thread_id", thread_id));
@@ -401,6 +434,31 @@ fn check(data: &mut Data) -> Result<()> {
         feed.seen.drain(..excess);
     }
     save(data)
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// One digest run. Sending runs save the state even when a send fails, so
+/// already sent reports are not repeated and unsent ones are retried next time.
+fn digest_check(data: &mut Data, preview_hours: Option<f64>) -> Result<()> {
+    let gl = gitlab::Gitlab::from_env()?;
+    let opts = digest::Options::from_env()?;
+    let tg = TgConfig::from(data);
+    let now = unix_now();
+    let state = data.digest.get_or_insert_with(Default::default);
+    if let Some(hours) = preview_hours {
+        let from = now - (hours * 3600.0) as i64;
+        return digest::run_once(&gl, state, &opts, now, Some(from), None);
+    }
+    let send = |text: &str| tg.send_html(text);
+    let result = digest::run_once(&gl, state, &opts, now, None, Some(&send));
+    save(data)?;
+    result
 }
 
 fn run(args: &[&str]) -> Result<()> {
@@ -535,6 +593,51 @@ fn run(args: &[&str]) -> Result<()> {
             println!("\n{sent} of {} items would be sent", items.len());
         }
         ["check"] => check(&mut data)?,
+        ["digest", "preview", rest @ ..] if rest.len() <= 1 => {
+            let hours: f64 = match rest.first() {
+                Some(h) => h.parse().map_err(|_| format!("invalid hours: {h}"))?,
+                None => 1.0,
+            };
+            digest_check(&mut data, Some(hours))?;
+        }
+        ["digest", "check"] => digest_check(&mut data, None)?,
+        ["digest", "today"] => {
+            let state = data.digest.unwrap_or_default();
+            for day in state.finished_days.iter().chain([&state.today]) {
+                println!(
+                    "{}\n",
+                    digest::render_day("today", day).unwrap_or_else(|| "No commits yet.".into())
+                );
+            }
+        }
+        ["digest", "run"] => {
+            println!("Sending a digest at the top of every hour. Ctrl+C to stop.");
+            loop {
+                let now = unix_now();
+                // A few seconds past the hour, so the window is complete.
+                let next = (now / 3600 + 1) * 3600 + 5;
+                thread::sleep(Duration::from_secs((next - now) as u64));
+                if let Err(e) = load().and_then(|mut d| digest_check(&mut d, None)) {
+                    eprintln!("[error] digest: {e}");
+                }
+            }
+        }
+        ["alias"] => {
+            let state = data.digest.unwrap_or_default();
+            if state.aliases.is_empty() {
+                println!("No aliases.");
+            }
+            for (from, to) in &state.aliases {
+                println!("{from} -> {to}");
+            }
+        }
+        ["alias", from, to] => {
+            let key = if from.contains('@') { from.to_lowercase() } else { from.to_string() };
+            let state = data.digest.get_or_insert_with(Default::default);
+            state.aliases.insert(key.clone(), to.to_string());
+            save(&data)?;
+            println!("{key} -> {to}");
+        }
         [] | ["run"] | ["run", _] => {
             let minutes: f64 = match args.get(1) {
                 Some(m) => m.parse().map_err(|_| format!("invalid minutes: {m}"))?,
