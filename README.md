@@ -89,6 +89,65 @@ The trailing space after `(main|master)` keeps branches like `master-old` out.
 Other useful patterns: `at Group / project$` (one project), `^Jane Doe` (one
 author).
 
+## Commit digest instead of one message per event
+
+`digest run` posts one short report per hour instead of a message for every
+event, and at local midnight one report for the whole day:
+
+```
+Team · 13:00–14:00 · 23 commits · 9 MRs merged
+
+Jane Doe — 8
+  fix(auth): session expires right after password reset
+  fix(orders): totals rounded twice on the summary page
+  feat(reports): export filters to the monthly report
+  …and 5 more
+John Smith — 6
+  …
+
+Releases: backend 1.4.0
+```
+
+```
+Team · day 06.11.2026 · 87 commits · 9 people
+
+Alice Brown — 5
+Bob Green — 12
+…
+```
+
+The hourly report lists people by number of commits, the day report by name.
+Hours with no commits, merges or tags send nothing.
+
+It reads the GitLab API, not the activity feed, so it sees every commit on every
+branch (the feed only keeps the last 20 events and shows one title per push).
+It needs `GITLAB_URL`, `GITLAB_GROUP` and `GITLAB_TOKEN` (a personal, group or
+project access token with the `read_api` scope).
+Every project of the group (and its subgroups) is counted; `GITLAB_PROJECTS`
+limits it to a list of project paths.
+
+- Merge commits are not counted; merged MRs are shown as a total.
+- A commit copied by rebase or cherry-pick (same author, author date and title)
+  counts once.
+- Commits pushed late still appear once, in the next hourly report (the last 48
+  hours are re-read every run). The day report is the sum of that day's hourly
+  reports.
+- If GitLab or Telegram can't be reached (e.g. VPN down), nothing is lost: the next
+  successful run covers the whole gap, and an unsent day report is sent then.
+- People with several names or e-mails can be merged:
+  `local-gitlab-rss alias jane.doe@personal.example 'Jane Doe'`.
+- Bots can be skipped with `DIGEST_EXCLUDE='^Deployment Bot$'`.
+
+```bash
+local-gitlab-rss digest preview 3   # print the last 3 hours, send nothing
+local-gitlab-rss digest check       # send what happened since the last check
+local-gitlab-rss digest run         # every hour, and the day report at midnight
+local-gitlab-rss digest today       # today's counts so far
+```
+
+Run `digest run` instead of `run` (or keep `run` with a filter for tags only),
+otherwise the chat gets both. For systemd, use `ExecStart=… local-gitlab-rss digest run`.
+
 ## Configuration
 
 Settings come from environment variables or from a `.env` file in the data
@@ -100,6 +159,14 @@ directory. Real environment variables take precedence.
 | `TELEGRAM_CHAT_ID` | Chat to send to. Optional: `local-gitlab-rss telegram` saves it to `data.json` |
 | `TELEGRAM_THREAD_ID` | Forum topic id, for groups with topics enabled (optional) |
 | `LOCAL_GITLAB_RSS_DIR` | Directory with `data.json` and `.env`. Defaults to the project directory at build time |
+| `GITLAB_URL` | Digest: GitLab base URL, e.g. `https://gitlab.example.com` |
+| `GITLAB_TOKEN` | Digest: access token with the `read_api` scope |
+| `GITLAB_GROUP` | Digest: group path or id whose projects (and subgroups) are counted |
+| `GITLAB_PROJECTS` | Digest: only these project paths, comma-separated, e.g. `backend,frontend` (default: every project of the group) |
+| `DIGEST_UTC_OFFSET` | Digest: local time zone in whole hours (default `5`) |
+| `DIGEST_TITLES` | Digest: commit titles shown per person (default `3`) |
+| `DIGEST_TITLE_LEN` | Digest: characters per title (default `60`) |
+| `DIGEST_EXCLUDE` | Digest: regex on author name or e-mail to skip |
 
 For a forum topic, the topic id is the middle number in a message link
 (`https://t.me/c/<chat>/<thread_id>/<message>`); `TELEGRAM_CHAT_ID` must then
