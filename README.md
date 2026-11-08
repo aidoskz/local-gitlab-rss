@@ -158,7 +158,7 @@ directory. Real environment variables take precedence.
 | `TELEGRAM_TOKEN` | Bot token from @BotFather (required) |
 | `TELEGRAM_CHAT_ID` | Chat to send to. Optional: `local-gitlab-rss telegram` saves it to `data.json` |
 | `TELEGRAM_THREAD_ID` | Forum topic id, for groups with topics enabled (optional) |
-| `LOCAL_GITLAB_RSS_DIR` | Directory with `data.json` and `.env`. Defaults to the project directory at build time |
+| `LOCAL_GITLAB_RSS_DIR` | Directory with `data.json` and `.env`. Defaults to the binary's directory when they are next to it, otherwise the project directory it was built in |
 | `GITLAB_URL` | Digest: GitLab base URL, e.g. `https://gitlab.example.com` |
 | `GITLAB_TOKEN` | Digest: access token with the `read_api` scope |
 | `GITLAB_GROUP` | Digest: group path or id whose projects (and subgroups) are counted |
@@ -209,8 +209,9 @@ export LOCAL_GITLAB_RSS_DIR=~/local-gitlab-rss
 ./local-gitlab-rss run
 ```
 
-`LOCAL_GITLAB_RSS_DIR` is required here, because a binary built elsewhere
-points at the build machine's project directory by default.
+With `.env` and `data.json` next to the binary, it finds them on its own.
+Set `LOCAL_GITLAB_RSS_DIR` when they live elsewhere; `run` and `digest run`
+print the directory they use at start.
 
 To keep it running, use a systemd service, e.g.
 `/etc/systemd/system/local-gitlab-rss.service`:
